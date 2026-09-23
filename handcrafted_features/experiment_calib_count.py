@@ -1,39 +1,30 @@
 # -*- coding: utf-8 -*-
 """
-測試「校正事件的組成」對績效的影響——不動校正次數(維持6次)，只改挑哪6個。
+測試「校正事件的次數」對績效的影響——維持隨機挑選(現況策略、BGM優先)，只改
+6 個變成幾個。
 
-動機：centering 是目前唯一真正有效的環節(raw 0.598 → centered_6 0.636)，而它替
-held-out 受試者算基準線時，那 6 個校正事件是**完全隨機**抽的，不看 BG_Level：
+動機：experiment_calib_composition.py 已經確認「改挑哪 6 個」沒有幫助(改挑 Normal
+反而稍微變差)，但那支腳本刻意「不動校正次數」。既然 centering 是目前唯一有效的槓桿，
+自然要問：基準線用更多筆事件估，會不會更準。
 
-    pool = np.where(subj == u)[0]
-    pick = rng2.choice(pool, size=min(N_CALIB_EVENTS, len(pool)), replace=False)
+三個設定：
+  centered_6（現況）
+  centered_12
+  centered_18
 
-但每個人的 Normal/High 比例差很多(2131 是 8% High、2294 是 71% High)，所以隨機
-抽出來的基準線，對不同人代表的意義不一樣：有人的基準線是「我的正常狀態」，有人
-的是「正常和高血糖的混合」。
+訓練端跟 calib_composition 的「random（現況）」策略一致：用該人全部事件算基準線，
+只有測試端的校正事件數量改變。
 
-注意這不會縮小同一個人內部的類別差距(減常數只是平移，不改變個人內排序)，真正的
-問題是**不同人被錨定在不同位置**：甲的 Normal 落在 0、High 落在 +20，乙的 Normal
-落在 -13、High 落在 +7。RF 只有一套決策規則，卻要同時處理這兩種錨點。如果大家都
-用 Normal 校正，「0 ≈ 我的正常狀態」對每個人才會一致。
+評估上的處理跟 calib_composition 一樣：排除掉三種設定校正事件的聯集，讓三個數字都在
+完全相同的事件集合上被評分才能配對比較。代價是這個數字不能直接跟現有的 0.636 比
+(評估集合變小)，所以另外附上「centered_6 + 不排除校正事件」對照現況。
 
-三種策略：
-  random       現況：6 個隨機 BGM 事件；訓練端用該人全部事件算基準線
-  normal_test  測試端改抽 6 個 Normal 事件；訓練端維持不變
-  normal_both  測試端抽 6 個 Normal；訓練端也只用 Normal 事件算基準線
-               (讓整個特徵空間都錨定在「正常狀態」，是這個想法最完整的版本)
-
-這不是 leakage：校正就是「扎手指量一次並回報數值」，那 6 筆的血糖值本來就已知，
-所以「請在正常狀態下校正」在部署時做得到，不需要任何未來資訊。
-
-評估上的處理：校正事件目前也會被拿去評估，若改成只挑 Normal，這幾筆保證是 Normal
-的事件會灌水 specificity。所以評估時**排除掉所有策略校正事件的聯集**，三種策略因此
-都在完全相同的事件集合上被評分，配對比較才成立。代價是這個數字不能直接跟現有的
-0.636 比(評估集合變小了)，所以另外附上「random 策略 + 不排除校正事件」的結果，
-用來對照現況並看出自我參照偏差有多大。
+注意：某些受試者的 BGM 事件數可能不到 12 或 18 筆，這種情況會直接把該人「全部」BGM
+事件都當校正事件(跟 make_calib 的 min(n_calib, len(pool)) 邏輯一致)，可能讓
+可評估人數隨 n_calib 增加而減少，執行時要看印出來的人數診斷。
 
 用法：
-  conda run -n ml python kfold/handcrafted_features/experiment_calib_composition.py
+  conda run -n ml python kfold/handcrafted_features/experiment_calib_count.py
 """
 
 import json
@@ -53,8 +44,7 @@ for _d in sorted(os.listdir(_KFOLD_ROOT)):
 
 from experiment_handcrafted_bgm import load_merged  # noqa: E402
 from experiment_handcrafted_classification import (  # noqa: E402
-    K_FOLDS, SEED, N_CALIB_EVENTS, MIN_PER_SIDE,
-    center_by_subject, pick_threshold, OUT_DIR,
+    K_FOLDS, SEED, MIN_PER_SIDE, center_by_subject, pick_threshold, OUT_DIR,
 )
 from binary_metrics import binary_metrics  # noqa: E402
 
@@ -62,35 +52,25 @@ POS_LEVEL, NEG_LEVELS = "High", ["Normal"]
 RF_PARAMS = dict(n_estimators=300, max_depth=6, class_weight="balanced",
                  random_state=0, n_jobs=8)
 N_BOOT = 10000
+CALIB_COUNTS = [6, 12, 18]
 
 
-def make_calib(subj, src, y, uuids, normal_only):
-    """挑每個人的 6 個校正事件。
-
-    normal_only=False 時逐行等同 plot_rf_report.build_predictions 的抽樣邏輯
-    (同樣的 SEED、同樣的順序)，所以會抽到完全相同的那 6 個事件，可以當對照組。
-    """
+def make_calib(subj, src, uuids, n_calib):
+    """挑每個人的 n_calib 個校正事件（隨機、BGM優先，跟現況抽樣邏輯一致）。"""
     rng2 = np.random.RandomState(SEED)
     calib = np.zeros(len(subj), bool)
     for u in uuids:
         pool = np.where(subj == u)[0]
         pool_bgm = pool[src[pool] == "BGM"]
         pool = pool_bgm if len(pool_bgm) > 0 else pool
-        if normal_only:
-            pool_n = pool[y[pool] == 0]
-            if len(pool_n) > 0:
-                pool = pool_n
-        pick = rng2.choice(pool, size=min(N_CALIB_EVENTS, len(pool)), replace=False)
+        pick = rng2.choice(pool, size=min(n_calib, len(pool)), replace=False)
         calib[pick] = True
     return calib
 
 
-def run_strategy(X, y, subj, src, uuids, folds, calib, train_normal_only):
-    """跑 5 折，回傳每個事件的 centered_6 分數與門檻。
-
-    train_normal_only=True 時，訓練受試者的基準線只用他們的 Normal 事件來算
-    (測試端一律用 calib 指定的那 6 筆)。
-    """
+def run_strategy(X, y, subj, src, uuids, folds, calib):
+    """跑 5 折 centered_N：訓練端維持現況(用該人全部事件算基準線)，
+    測試端用 calib 指定的那批事件當校正參考。"""
     score = np.full(len(y), np.nan)
     thr_all = np.full(len(y), np.nan)
     for f in range(K_FOLDS):
@@ -101,9 +81,7 @@ def run_strategy(X, y, subj, src, uuids, folds, calib, train_normal_only):
             continue
 
         Xc = X.copy()
-        tr_ref = (y == 0) if train_normal_only else None
-        Xc[tr] = center_by_subject(X[tr], subj[tr],
-                                   ref_idx=None if tr_ref is None else tr_ref[tr])
+        Xc[tr] = center_by_subject(X[tr], subj[tr])
         Xc[te] = center_by_subject(X[te], subj[te], ref_idx=calib[te])
 
         sc = StandardScaler().fit(Xc[tr])
@@ -116,7 +94,7 @@ def run_strategy(X, y, subj, src, uuids, folds, calib, train_normal_only):
 
 
 def run_raw(X, y, subj, src, uuids, folds):
-    """不做 centering 的對照(跟校正策略無關，僅供參考)。"""
+    """不做 centering 的對照(跟校正次數無關，僅供參考)。"""
     score = np.full(len(y), np.nan)
     thr_all = np.full(len(y), np.nan)
     for f in range(K_FOLDS):
@@ -159,7 +137,7 @@ def paired_bootstrap(base, new, key="auc"):
 
 
 def main():
-    out_dir = os.path.join(OUT_DIR, "calib_composition")
+    out_dir = os.path.join(OUT_DIR, "calib_count")
     os.makedirs(out_dir, exist_ok=True)
 
     ev_all, feat_cols, _ = load_merged()
@@ -176,14 +154,16 @@ def main():
     order = rng.permutation(len(uuids))
     folds = {u: i % K_FOLDS for i, u in enumerate(uuids[order])}
 
-    calib_rand = make_calib(subj, src, y, uuids, normal_only=False)
-    calib_norm = make_calib(subj, src, y, uuids, normal_only=True)
-    print(f"隨機校正事件 {calib_rand.sum()} 個，其中 High {int(y[calib_rand].sum())} 個"
-          f"（{y[calib_rand].mean():.1%} 被污染）")
-    print(f"Normal校正事件 {calib_norm.sum()} 個，其中 High {int(y[calib_norm].sum())} 個")
+    calibs = {n: make_calib(subj, src, uuids, n) for n in CALIB_COUNTS}
+    for n in CALIB_COUNTS:
+        c = calibs[n]
+        print(f"n_calib={n:>2}：校正事件 {c.sum()} 個，其中 High {int(y[c].sum())} 個"
+              f"（{y[c].mean():.1%} 被污染）")
 
-    # 評估集合排除兩組校正事件的聯集，讓所有策略在同一批事件上被評分
-    excl = calib_rand | calib_norm
+    # 排除三種校正次數設定的聯集，讓三個數字在同一批事件上被評分
+    excl = np.zeros(len(y), bool)
+    for c in calibs.values():
+        excl |= c
     eval_common = ~excl
     eval_full = np.ones(len(y), bool)
     print(f"排除校正事件聯集 {excl.sum()} 個後，可評估事件 {eval_common.sum():,}/{len(y):,}")
@@ -191,59 +171,53 @@ def main():
     print("\n跑 raw（無 centering，對照用）...")
     s_raw, t_raw = run_raw(X, y, subj, src, uuids, folds)
 
-    strategies = {
-        "random（現況）": (calib_rand, False),
-        "normal_test（測試端改用Normal校正）": (calib_norm, False),
-        "normal_both（訓練端也只用Normal錨定）": (calib_norm, True),
-    }
     scores = {}
-    for name, (calib, tn) in strategies.items():
-        print(f"跑 centered_6 / {name} ...")
-        scores[name] = run_strategy(X, y, subj, src, uuids, folds, calib, tn)
+    for n in CALIB_COUNTS:
+        print(f"跑 centered_{n} ...")
+        scores[n] = run_strategy(X, y, subj, src, uuids, folds, calibs[n])
 
     rows, metrics = [], {}
+
     def add(label, score, thr, mask, tag):
         m = per_subject_metrics(y, subj, score, thr, mask)
         metrics[f"{label}|{tag}"] = m
         vals = [m[u]["auc"] for u in m if m[u]["auc"] is not None]
         rec = [m[u]["recall"] for u in m if m[u]["recall"] is not None]
         spe = [m[u]["specificity"] for u in m if m[u]["specificity"] is not None]
-        rows.append({"策略": label, "評估集": tag, "人數": len(m),
+        rows.append({"設定": label, "評估集": tag, "人數": len(m),
                      "AUC": float(np.mean(vals)) if vals else None,
                      "recall": float(np.mean(rec)) if rec else None,
                      "specificity": float(np.mean(spe)) if spe else None})
 
-    # 對照現況：random + 不排除校正事件（可與既有的 0.598/0.636 對照）
+    # 對照現況：centered_6 + 不排除校正事件(可與既有的 0.636 對照)
     add("raw（無centering）", s_raw, t_raw, eval_full, "含校正事件")
-    add("random（現況）", *scores["random（現況）"], eval_full, "含校正事件")
-    # 主要比較：三種策略，同一個排除聯集後的評估集合
+    add("centered_6（現況）", *scores[6], eval_full, "含校正事件")
+    # 主要比較：三種校正次數，同一個排除聯集後的評估集合
     add("raw（無centering）", s_raw, t_raw, eval_common, "排除校正事件")
-    for name in strategies:
-        add(name, *scores[name], eval_common, "排除校正事件")
+    for n in CALIB_COUNTS:
+        add(f"centered_{n}", *scores[n], eval_common, "排除校正事件")
 
     df = pd.DataFrame(rows)
     print("\n" + "=" * 92)
     print(df.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
 
     print("\n" + "=" * 92)
-    print("配對比較（同一批人，AUC 差值 + bootstrap 95% CI；基準＝random 策略，排除校正事件）")
+    print("配對比較（同一批人，AUC 差值 + bootstrap 95% CI；基準＝centered_6，排除校正事件）")
     print("=" * 92)
-    base = metrics["random（現況）|排除校正事件"]
+    base = metrics["centered_6|排除校正事件"]
     boots = {}
-    for name in list(strategies)[1:]:
-        b = paired_bootstrap(base, metrics[f"{name}|排除校正事件"])
-        boots[name] = b
+    for n in CALIB_COUNTS[1:]:
+        b = paired_bootstrap(base, metrics[f"centered_{n}|排除校正事件"])
+        boots[n] = b
         if b is None:
             continue
         verdict = "顯著" if b["significant"] else "與雜訊分不開"
-        print(f"  {name:40} {b['mean_diff']:+.4f}  "
+        print(f"  centered_{n:<3} {b['mean_diff']:+.4f}  "
               f"95%CI=[{b['ci_low']:+.4f}, {b['ci_high']:+.4f}]  n={b['n']}  {verdict}")
 
     with open(os.path.join(out_dir, "results.json"), "w", encoding="utf-8") as fp:
         json.dump({"summary": rows, "paired_bootstrap": boots,
-                   "calib_contamination": {
-                       "random_high_ratio": float(y[calib_rand].mean()),
-                       "normal_high_ratio": float(y[calib_norm].mean())},
+                   "calib_contamination": {str(n): float(y[calibs[n]].mean()) for n in CALIB_COUNTS},
                    "per_subject": metrics}, fp, ensure_ascii=False, indent=2)
     print(f"\n寫入 {os.path.join(out_dir, 'results.json')}")
 
